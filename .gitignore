@@ -1,0 +1,7 @@
+node_modules/
+dist/
+device-state.json
+wallet.json
+server.log
+*.log
+.env
