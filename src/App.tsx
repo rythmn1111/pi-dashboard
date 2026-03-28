@@ -150,7 +150,7 @@ function TerminalRow({ item }: { item: any }) {
 // ── Full-screen Terminal View ─────────────────────────────────────────────────
 
 interface TermStep { key: string; label: string; status: 'running' | 'done' | 'error'; detail?: string }
-interface TermEntry { id: string; command: string; state: 'running' | 'done' | 'error'; steps: TermStep[]; output?: string; exit_code?: number; verified?: boolean }
+interface TermEntry { id: string; command: string; state: 'running' | 'done' | 'error'; steps: TermStep[]; output?: string; exit_code?: number; verified?: boolean; jobId?: string; isVeriPy?: boolean }
 
 function TerminalView({ deviceId, onBack }: { deviceId: string; onBack: () => void }) {
   const [entries, setEntries] = useState<TermEntry[]>([])
@@ -179,35 +179,72 @@ function TerminalView({ deviceId, onBack }: { deviceId: string; onBack: () => vo
     if (!input.trim() || running) return
     const cmd = input.trim()
     const entryId = `e-${Date.now()}`
+    const isVeriPy = cmd.startsWith('veri_py ')
     setInput(''); setRunning(true)
-    setEntries(prev => [...prev, { id: entryId, command: cmd, state: 'running', steps: [] }])
+    setEntries(prev => [...prev, { id: entryId, command: cmd, state: 'running', steps: [], isVeriPy }])
     try {
-      const res = await fetch('/api/terminal/stream', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ command: cmd }) })
-      if (!res.ok || !res.body) throw new Error('stream error')
-      const reader = res.body.getReader(); const decoder = new TextDecoder(); let buf = ''
-      while (true) {
-        const { done, value } = await reader.read(); if (done) break
-        buf += decoder.decode(value, { stream: true })
-        const lines = buf.split('\n'); buf = lines.pop() ?? ''
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          let ev: any; try { ev = JSON.parse(line.slice(6)) } catch { continue }
-          switch (ev.step) {
-            case 'hash_cmd': upsertStep(entryId, { key: 'hash_cmd', label: 'Command hashed', status: 'done', detail: `sha256 = ${String(ev.command_hash).slice(0,16)}…` }); break
-            case 'challenge':
-              if (ev.status === 'pending') upsertStep(entryId, { key: 'challenge', label: 'Requesting nonce from AO…', status: 'running' })
-              else if (ev.status === 'done') upsertStep(entryId, { key: 'challenge', label: 'Nonce received', status: 'done', detail: String(ev.nonce) })
-              else upsertStep(entryId, { key: 'challenge', label: 'Challenge failed', status: 'error', detail: String(ev.error ?? '') }); break
-            case 'execute':
-              if (ev.status === 'pending') upsertStep(entryId, { key: 'execute', label: 'Executing…', status: 'running' })
-              else upsertStep(entryId, { key: 'execute', label: 'Executed', status: 'done', detail: `exit ${ev.exit_code}` }); break
-            case 'hash_out': upsertStep(entryId, { key: 'hash_out', label: 'Output hashed', status: 'done', detail: `sha256 = ${String(ev.output_hash).slice(0,16)}…` }); break
-            case 'attest':
-              if (ev.status === 'pending') upsertStep(entryId, { key: 'attest', label: 'Submitting to HyperBEAM…', status: 'running' })
-              else if (ev.status === 'done') upsertStep(entryId, { key: 'attest', label: 'Attested on-chain', status: 'done', detail: '✓ VERIFIED' })
-              else upsertStep(entryId, { key: 'attest', label: 'Attestation failed', status: 'error', detail: String(ev.error ?? '') }); break
-            case 'complete': updateEntry(entryId, { state: 'done', output: ev.output, exit_code: ev.exit_code, verified: ev.verified }); break
-            case 'error': upsertStep(entryId, { key: 'err', label: String(ev.error ?? 'Unknown error'), status: 'error' }); updateEntry(entryId, { state: 'error' }); break
+      if (isVeriPy) {
+        const file = cmd.slice('veri_py '.length).trim()
+        const res = await fetch('/api/run-py/stream', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ file }) })
+        if (!res.ok || !res.body) throw new Error('stream error')
+        const reader = res.body.getReader(); const decoder = new TextDecoder(); let buf = ''
+        while (true) {
+          const { done, value } = await reader.read(); if (done) break
+          buf += decoder.decode(value, { stream: true })
+          const lines = buf.split('\n'); buf = lines.pop() ?? ''
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue
+            let ev: any; try { ev = JSON.parse(line.slice(6)) } catch { continue }
+            switch (ev.step) {
+              case 'hash_file': upsertStep(entryId, { key: 'hash_file', label: 'File hashed', status: 'done', detail: `sha256 = ${String(ev.file_hash).slice(0,16)}…` }); break
+              case 'challenge':
+                if (ev.status === 'pending') upsertStep(entryId, { key: 'challenge', label: 'Requesting nonce from AO…', status: 'running' })
+                else if (ev.status === 'done') upsertStep(entryId, { key: 'challenge', label: 'Nonce received', status: 'done', detail: String(ev.nonce) })
+                else upsertStep(entryId, { key: 'challenge', label: 'Challenge failed', status: 'error', detail: String(ev.error ?? '') }); break
+              case 'execute':
+                if (ev.status === 'pending') upsertStep(entryId, { key: 'execute', label: 'Running python3…', status: 'running' })
+                else upsertStep(entryId, { key: 'execute', label: 'Finished', status: 'done', detail: `exit ${ev.exit_code}` }); break
+              case 'job_started': updateEntry(entryId, { jobId: ev.job_id }); break
+              case 'output':
+                setEntries(prev => prev.map(e => e.id !== entryId ? e : { ...e, output: (e.output || '') + ev.text })); break
+              case 'hash_out': upsertStep(entryId, { key: 'hash_out', label: 'Output hashed', status: 'done', detail: `sha256 = ${String(ev.output_hash).slice(0,16)}…` }); break
+              case 'attest':
+                if (ev.status === 'pending') upsertStep(entryId, { key: 'attest', label: 'Submitting to HyperBEAM…', status: 'running' })
+                else if (ev.status === 'done') upsertStep(entryId, { key: 'attest', label: 'Attested on-chain', status: 'done', detail: '✓ VERIFIED' })
+                else upsertStep(entryId, { key: 'attest', label: 'Attestation failed', status: 'error', detail: String(ev.error ?? '') }); break
+              case 'complete': updateEntry(entryId, { state: 'done', exit_code: ev.exit_code, verified: ev.verified }); break
+              case 'error': upsertStep(entryId, { key: 'err', label: String(ev.error ?? 'Unknown error'), status: 'error' }); updateEntry(entryId, { state: 'error' }); break
+            }
+          }
+        }
+      } else {
+        const res = await fetch('/api/terminal/stream', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ command: cmd }) })
+        if (!res.ok || !res.body) throw new Error('stream error')
+        const reader = res.body.getReader(); const decoder = new TextDecoder(); let buf = ''
+        while (true) {
+          const { done, value } = await reader.read(); if (done) break
+          buf += decoder.decode(value, { stream: true })
+          const lines = buf.split('\n'); buf = lines.pop() ?? ''
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue
+            let ev: any; try { ev = JSON.parse(line.slice(6)) } catch { continue }
+            switch (ev.step) {
+              case 'hash_cmd': upsertStep(entryId, { key: 'hash_cmd', label: 'Command hashed', status: 'done', detail: `sha256 = ${String(ev.command_hash).slice(0,16)}…` }); break
+              case 'challenge':
+                if (ev.status === 'pending') upsertStep(entryId, { key: 'challenge', label: 'Requesting nonce from AO…', status: 'running' })
+                else if (ev.status === 'done') upsertStep(entryId, { key: 'challenge', label: 'Nonce received', status: 'done', detail: String(ev.nonce) })
+                else upsertStep(entryId, { key: 'challenge', label: 'Challenge failed', status: 'error', detail: String(ev.error ?? '') }); break
+              case 'execute':
+                if (ev.status === 'pending') upsertStep(entryId, { key: 'execute', label: 'Executing…', status: 'running' })
+                else upsertStep(entryId, { key: 'execute', label: 'Executed', status: 'done', detail: `exit ${ev.exit_code}` }); break
+              case 'hash_out': upsertStep(entryId, { key: 'hash_out', label: 'Output hashed', status: 'done', detail: `sha256 = ${String(ev.output_hash).slice(0,16)}…` }); break
+              case 'attest':
+                if (ev.status === 'pending') upsertStep(entryId, { key: 'attest', label: 'Submitting to HyperBEAM…', status: 'running' })
+                else if (ev.status === 'done') upsertStep(entryId, { key: 'attest', label: 'Attested on-chain', status: 'done', detail: '✓ VERIFIED' })
+                else upsertStep(entryId, { key: 'attest', label: 'Attestation failed', status: 'error', detail: String(ev.error ?? '') }); break
+              case 'complete': updateEntry(entryId, { state: 'done', output: ev.output, exit_code: ev.exit_code, verified: ev.verified }); break
+              case 'error': upsertStep(entryId, { key: 'err', label: String(ev.error ?? 'Unknown error'), status: 'error' }); updateEntry(entryId, { state: 'error' }); break
+            }
           }
         }
       }
@@ -218,7 +255,7 @@ function TerminalView({ deviceId, onBack }: { deviceId: string; onBack: () => vo
     setRunning(false); setTimeout(() => inputRef.current?.focus(), 50)
   }
 
-  const T = { bg: '#0a0a0a', surf: '#111', border: '#1e1e1e', prompt: '#c84b00', out: '#e8dcc8', muted: '#555', run: '#f59e0b', done: '#4ade80', err: '#f87171', det: '#60a5fa' }
+    const T = { bg: '#0a0a0a', surf: '#111', border: '#1e1e1e', prompt: '#c84b00', out: '#e8dcc8', muted: '#555', run: '#f59e0b', done: '#4ade80', err: '#f87171', det: '#60a5fa' }
   return (
     <div style={{ position: 'fixed', inset: 0, background: T.bg, fontFamily: "'SF Mono','Fira Code','Courier New',monospace", display: 'flex', flexDirection: 'column', zIndex: 999 }}>
       <div style={{ background: T.surf, borderBottom: `1px solid ${T.border}`, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: '14px', flexShrink: 0 }}>
@@ -242,6 +279,14 @@ function TerminalView({ deviceId, onBack }: { deviceId: string; onBack: () => vo
               <span style={{ color: T.out, fontSize: 14 }}>{entry.command}</span>
               {entry.state === 'done' && entry.verified && <span style={{ fontSize: 9, fontWeight: 700, color: T.done, background: 'rgba(74,222,128,0.1)', border: '1px solid rgba(74,222,128,0.22)', borderRadius: 4, padding: '2px 7px' }}>✓ ATTESTED</span>}
               {entry.state === 'error' && <span style={{ fontSize: 9, fontWeight: 700, color: T.err, background: 'rgba(248,113,113,0.1)', border: '1px solid rgba(248,113,113,0.22)', borderRadius: 4, padding: '2px 7px' }}>✗ FAILED</span>}
+              {entry.isVeriPy && entry.state === 'running' && entry.jobId && (
+                <button onClick={async () => {
+                  await fetch('/api/run-py/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: entry.jobId }) }).catch(() => {})
+                  updateEntry(entry.id, { state: 'error' })
+                  setRunning(false)
+                  setTimeout(() => inputRef.current?.focus(), 50)
+                }} style={{ fontSize: 10, fontWeight: 700, color: T.err, background: 'rgba(248,113,113,0.12)', border: '1px solid rgba(248,113,113,0.3)', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontFamily: 'inherit' }}>■ Stop</button>
+              )}
             </div>
             {entry.steps.length > 0 && (
               <div style={{ paddingLeft: 22, marginBottom: 4 }}>
@@ -254,7 +299,12 @@ function TerminalView({ deviceId, onBack }: { deviceId: string; onBack: () => vo
                 ))}
               </div>
             )}
-            {entry.state !== 'running' && <pre style={{ color: entry.exit_code !== 0 ? T.err : '#c8c0b4', fontSize: 13, lineHeight: 1.6, padding: '6px 0 2px 22px', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: 'transparent', border: 'none' }}>{entry.output || (entry.state === 'error' ? '' : '(no output)')}</pre>}
+            {(entry.isVeriPy || entry.state !== 'running') && entry.output !== undefined && (
+              <pre style={{ color: entry.exit_code !== 0 ? T.err : '#c8c0b4', fontSize: 13, lineHeight: 1.6, padding: '6px 0 2px 22px', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: 'transparent', border: 'none' }}>{entry.output || (entry.state === 'error' ? '' : '(no output)')}</pre>
+            )}
+            {!entry.isVeriPy && entry.state !== 'running' && entry.output === undefined && (
+              <pre style={{ color: '#c8c0b4', fontSize: 13, lineHeight: 1.6, padding: '6px 0 2px 22px', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: 'transparent', border: 'none' }}>(no output)</pre>
+            )}
           </div>
         ))}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4, minHeight: 22 }}>

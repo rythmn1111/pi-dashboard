@@ -97,6 +97,7 @@ let sensorLog = ''
 let sensorRunning = false
 let sensorLastRun: number | null = null
 let sensorCodeHash = ''
+const runningJobs = new Map<string, ReturnType<typeof spawn>>()
 
 function startSensor() {
   if (sensorRunning) return { ok: false, message: 'Sensor already running' }
@@ -365,6 +366,56 @@ Bun.serve({ idleTimeout: 120,
     }
 
 
+
+    // POST /api/run-py/stream — verified Python execution with live streaming output
+    if (url.pathname === '/api/run-py/stream' && req.method === 'POST') {
+      const body = await req.json()
+      const file = String(body.file || '').trim()
+      if (!file) return Response.json({ ok: false, error: 'file required' }, { headers: CORS })
+      const jobId = `vpj-${Date.now()}`
+      const enc = new TextEncoder()
+      const { readable, writable } = new TransformStream()
+      const writer = writable.getWriter()
+      const send = async (data: object) => writer.write(enc.encode('data: ' + JSON.stringify(data) + '\n\n')).catch(() => {})
+      ;(async () => {
+        try {
+          const fileContent = readFileSync(file, 'utf-8')
+          const file_hash = createHash('sha256').update(fileContent).digest('hex')
+          await send({ step: 'hash_file', status: 'done', file_hash })
+          await send({ step: 'challenge', status: 'pending' })
+          const cr = await getChallengeDirect(deviceState.device_id)
+          if (cr.error) { await send({ step: 'error', error: 'Challenge failed: ' + cr.error }); await writer.close().catch(() => {}); return }
+          await send({ step: 'challenge', status: 'done', nonce: cr.nonce })
+          await send({ step: 'execute', status: 'pending' })
+          let fullOutput = ''
+          const proc = spawn('python3', [file], { cwd: sessionCwd, env: process.env })
+          runningJobs.set(jobId, proc)
+          await send({ step: 'job_started', job_id: jobId })
+          proc.stdout?.on('data', async (chunk: Buffer) => { const text = chunk.toString(); fullOutput += text; await send({ step: 'output', text }) })
+          proc.stderr?.on('data', async (chunk: Buffer) => { const text = chunk.toString(); fullOutput += text; await send({ step: 'output', text, is_err: true }) })
+          const exit_code = await new Promise<number>((resolve) => { proc.on('close', (code: number | null) => resolve(code ?? -1)) })
+          runningJobs.delete(jobId)
+          await send({ step: 'execute', status: 'done', exit_code })
+          const output_hash = createHash('sha256').update(fullOutput).digest('hex')
+          await send({ step: 'hash_out', status: 'done', output_hash })
+          await send({ step: 'attest', status: 'pending' })
+          const attestRes = await hbSend('RecordCommand', { device_id: deviceState.device_id, command: 'veri_py ' + file, command_hash: file_hash, output: fullOutput, output_hash, nonce: cr.nonce, exit_code, local_timestamp: Date.now() })
+          if (!attestRes.ok) { await send({ step: 'attest', status: 'error', error: 'HB error: ' + attestRes.status }) }
+          else { await new Promise(r => setTimeout(r, 4000)); await send({ step: 'attest', status: 'done' }) }
+          await send({ step: 'complete', file, output: fullOutput, exit_code, file_hash, output_hash, nonce: cr.nonce, verified: attestRes.ok })
+        } catch (e: any) { await send({ step: 'error', error: e.message }).catch(() => {}) }
+        finally { await writer.close().catch(() => {}) }
+      })()
+      return new Response(readable, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*' } })
+    }
+
+    // POST /api/run-py/stop — kill a running veri_py job
+    if (url.pathname === '/api/run-py/stop' && req.method === 'POST') {
+      const { job_id } = await req.json()
+      const proc = runningJobs.get(job_id)
+      if (proc) { proc.kill('SIGTERM'); runningJobs.delete(job_id); return Response.json({ ok: true }, { headers: CORS }) }
+      return Response.json({ ok: false, error: 'job not found' }, { headers: CORS })
+    }
 
     // POST /api/terminal/stream — SSE: hash → challenge → execute → attest
     if (url.pathname === '/api/terminal/stream' && req.method === 'POST') {
