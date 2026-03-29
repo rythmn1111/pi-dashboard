@@ -343,6 +343,13 @@ export default function App() {
   const [termInput, setTermInput] = useState('')
   const [termRunning, setTermRunning] = useState(false)
   const [termHistory, setTermHistory] = useState<any[]>([])
+  const [batchRunning, setBatchRunning] = useState(false)
+  const [batchLog, setBatchLog] = useState<string[]>([])
+  const [batchHistory, setBatchHistory] = useState<any[]>([])
+  const [batchSize, setBatchSize] = useState(10)
+  const [batchJobId, setBatchJobId] = useState<string | null>(null)
+  const [, setCurrentBatch] = useState<{num: number; readings: string[]; hash?: string; attested?: boolean} | null>(null)
+  const batchReaderRef = useRef<ReadableStreamDefaultReader | null>(null)
   const [termError, setTermError] = useState<string | null>(null)
   const [view, setView] = useState<'dashboard' | 'terminal'>('dashboard')
 
@@ -371,7 +378,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    fetchStatus(); fetchClaimed(); fetchGpio(); fetchAttestations(); fetchSensorStatus()
+    fetchStatus(); fetchClaimed(); fetchGpio(); fetchAttestations(); fetchSensorStatus(); fetchBatchHistory()
     const attId = setInterval(fetchAttestations, 15000)
     const sensorId = setInterval(() => {
       fetchSensorStatus().then(() => {
@@ -414,6 +421,74 @@ export default function App() {
     setLoading(false)
   }
 
+
+  async function fetchBatchHistory() {
+    try {
+      const res = await fetch('/api/batch-history')
+      const list = await res.json()
+      setBatchHistory(Array.isArray(list) ? list.reverse() : [])
+    } catch {}
+  }
+
+  async function startBatch() {
+    if (batchRunning) return
+    setBatchRunning(true)
+    setBatchLog([])
+    setCurrentBatch(null)
+    const res = await fetch('/api/sensor-batch/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ batch_size: batchSize, interval_ms: 300 })
+    })
+    if (!res.ok || !res.body) { setBatchRunning(false); return }
+    const reader = res.body.getReader()
+    batchReaderRef.current = reader
+    const decoder = new TextDecoder(); let buf = ''
+    try {
+      while (true) {
+        const { done, value } = await reader.read(); if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const lines = buf.split('\n'); buf = lines.pop() ?? ''
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          let ev: any; try { ev = JSON.parse(line.slice(6)) } catch { continue }
+          if (ev.type === 'start') {
+            setBatchJobId(ev.job_id)
+            setBatchLog(p => [...p, `▶ Started batch sensor (batch_size=${ev.batch_size})`])
+          } else if (ev.type === 'batch_start') {
+            setCurrentBatch({ num: ev.batch_num, readings: [] })
+            setBatchLog(p => [...p, `─── Batch #${ev.batch_num} collecting ${batchSize} readings...`])
+          } else if (ev.type === 'reading') {
+            setCurrentBatch(prev => prev ? { ...prev, readings: [...prev.readings, ev.line] } : prev)
+            setBatchLog(p => [...p, ev.line])
+          } else if (ev.type === 'batch_hash') {
+            setCurrentBatch(prev => prev ? { ...prev, hash: ev.hash } : prev)
+            setBatchLog(p => [...p, `◆ batch_hash = ${ev.hash.slice(0,20)}…`])
+          } else if (ev.type === 'attested') {
+            setCurrentBatch(prev => prev ? { ...prev, attested: true } : prev)
+            setBatchLog(p => [...p, `✓ Attested on HyperBEAM! nonce=${ev.nonce}`])
+            fetchBatchHistory()
+          } else if (ev.type === 'stopped') {
+            setBatchRunning(false)
+          } else if (ev.type === 'err') {
+            setBatchLog(p => [...p, `✗ ${ev.line}`])
+          } else if (ev.type === 'log') {
+            if (ev.line) setBatchLog(p => [...p, ev.line])
+          }
+        }
+      }
+    } catch {}
+    setBatchRunning(false)
+  }
+
+  async function stopBatch() {
+    if (batchJobId) {
+      await fetch('/api/run-py/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: batchJobId }) }).catch(() => {})
+    }
+    batchReaderRef.current?.cancel().catch(() => {})
+    setBatchRunning(false)
+    setBatchJobId(null)
+  }
 
   async function loadTerminalHistory() {
     try {
@@ -682,7 +757,80 @@ export default function App() {
 
 
         {/* Verified Terminal */}
+        
+        {/* ── Batch Sensor Attestation ───────────────────────────────── */}
         <div style={s.fullCard}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
+            <div style={s.cardTitle}>Batch Sensor Attestation — MPU6050</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <label style={{ fontSize: '12px', color: C.muted }}>Batch size:</label>
+              <input type="number" min={2} max={50} value={batchSize} onChange={e => setBatchSize(parseInt(e.target.value) || 10)}
+                disabled={batchRunning}
+                style={{ width: '60px', padding: '4px 8px', border: `1px solid ${C.border}`, borderRadius: '6px', fontSize: '13px', fontFamily: 'monospace', backgroundColor: C.bg }} />
+              {!batchRunning
+                ? <button style={s.btn} onClick={startBatch}>▶ Start Batch</button>
+                : <button style={{ ...s.btnOutline, color: '#c62828', borderColor: '#c62828' }} onClick={stopBatch}>■ Stop</button>
+              }
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+            <div>
+              <div style={{ fontSize: '11px', color: C.muted, marginBottom: '8px', fontWeight: '700' }}>LIVE OUTPUT</div>
+              <div style={{ ...s.log, height: '280px', overflowY: 'auto' as const, fontSize: '11px', lineHeight: '1.7' }}>
+                {batchLog.length === 0
+                  ? <span style={{ color: '#6a5230' }}>Press Start to begin collecting sensor readings...</span>
+                  : batchLog.map((line, i) => (
+                    <div key={i} style={{
+                      color: line.startsWith('✓') ? '#4caf50'
+                           : line.startsWith('✗') ? '#e57373'
+                           : line.startsWith('◆') ? '#f59e0b'
+                           : line.startsWith('─') ? '#c84b00'
+                           : '#f5c97a'
+                    }}>{line}</div>
+                  ))
+                }
+              </div>
+            </div>
+
+            <div>
+              <div style={{ fontSize: '11px', color: C.muted, marginBottom: '8px', fontWeight: '700' }}>ATTESTED BATCHES</div>
+              <div style={{ height: '280px', overflowY: 'auto' as const }}>
+                {batchHistory.length === 0
+                  ? <div style={{ color: C.muted, fontSize: '13px' }}>No batches attested yet</div>
+                  : batchHistory.map((b, i) => {
+                    const ts = b.submitted_at ? new Date(b.submitted_at).toLocaleTimeString() : '—'
+                    const parts = (b.command || '').split(':')
+                    const sensor = parts[1] || 'sensor'
+                    const size = (parts[2] || '').replace('size=', '')
+                    const num = (parts[3] || '').replace('num=', '')
+                    return (
+                      <div key={i} style={{ borderRadius: '8px', border: `1px solid ${C.border}`, padding: '10px 14px', marginBottom: '8px', backgroundColor: C.bg }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                          <span style={{ fontSize: '13px', fontWeight: '700', color: C.orange }}>Batch #{num} — {sensor.toUpperCase()}</span>
+                          <span style={{ ...s.badge(C.green), fontSize: '10px' }}>✓ ATTESTED</span>
+                        </div>
+                        <div style={{ fontSize: '11px', fontFamily: 'monospace', color: C.muted, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px' }}>
+                          <div><span style={{ color: C.muted }}>batch_size: </span><span style={{ color: C.text }}>{size}</span></div>
+                          <div><span style={{ color: C.muted }}>time: </span><span style={{ color: C.text }}>{ts}</span></div>
+                          <div style={{ gridColumn: '1/-1' }}><span style={{ color: C.muted }}>batch_hash: </span><span style={{ color: C.text }}>{(b.output_hash || '').slice(0,24)}...</span></div>
+                          <div style={{ gridColumn: '1/-1' }}><span style={{ color: C.muted }}>nonce: </span><span style={{ color: C.text }}>{(b.nonce || '').slice(0,24)}...</span></div>
+                        </div>
+                      </div>
+                    )
+                  })
+                }
+              </div>
+            </div>
+          </div>
+
+          <div style={{ marginTop: '14px', padding: '12px 16px', backgroundColor: '#2d2013', borderRadius: '10px', fontSize: '11px', fontFamily: 'monospace', color: '#8c6a3f', lineHeight: '1.8' }}>
+            <span style={{ color: '#f5c97a' }}>batch_hash</span> = SHA256( raw_hash₁‖data_hash₁ ‖ raw_hash₂‖data_hash₂ ‖ ... ‖ raw_hashₙ‖data_hashₙ )
+            <span style={{ marginLeft: '16px', color: '#6a5230' }}>— one nonce covers all {batchSize} readings atomically</span>
+          </div>
+        </div>
+
+<div style={s.fullCard}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
             <div style={s.cardTitle}>Verified Terminal</div>
             <span style={{ fontSize: '11px', color: C.muted }}>Every command hashed + attested on HyperBEAM</span>

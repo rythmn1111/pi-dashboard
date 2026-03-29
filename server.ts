@@ -367,6 +367,126 @@ Bun.serve({ idleTimeout: 120,
 
 
 
+
+    // POST /api/attest-batch — batch sensor attestation (TSEL batching from whitepaper)
+    if (url.pathname === '/api/attest-batch' && req.method === 'POST') {
+      try {
+        const body = await req.json()
+        const { batch_hash, batch_size, batch_num, sensor, readings } = body
+        if (!batch_hash) return Response.json({ ok: false, message: 'batch_hash required' }, { headers: CORS })
+
+        // 1. Get challenge nonce
+        const cr = await getChallengeDirect(deviceState.device_id)
+        if (cr.error) return Response.json({ ok: false, message: 'Challenge failed: ' + cr.error }, { headers: CORS })
+
+        // 2. Hash the batch payload as the "command_hash" (represents the full batch)
+        const batch_payload = JSON.stringify({ batch_hash, batch_size, sensor, batch_num })
+        const payload_hash = createHash('sha256').update(batch_payload).digest('hex')
+
+        // 3. Submit attestation with batch_hash as output_hash (binds all N readings)
+        const attestRes = await hbSend('RecordCommand', {
+          device_id: deviceState.device_id,
+          command: `batch:${sensor}:size=${batch_size}:num=${batch_num}`,
+          command_hash: payload_hash,
+          output: batch_payload,
+          output_hash: batch_hash,
+          nonce: cr.nonce,
+          exit_code: 0,
+          local_timestamp: Date.now()
+        })
+        if (!attestRes.ok) return Response.json({ ok: false, message: 'HB error: ' + attestRes.status }, { headers: CORS })
+        await new Promise(r => setTimeout(r, 4000))
+
+        return Response.json({
+          ok: true,
+          nonce: cr.nonce,
+          batch_hash,
+          batch_size,
+          batch_num,
+          sensor,
+          payload_hash,
+          message: 'Batch attested on HyperBEAM'
+        }, { headers: CORS })
+      } catch (e: any) {
+        return Response.json({ ok: false, message: e.message }, { headers: CORS })
+      }
+    }
+
+    // GET /api/batch-history — return all batch attestations from terminal history
+    if (url.pathname === '/api/batch-history') {
+      try {
+        const result = await cuDryRun('GetTerminalHistory', deviceState.device_id)
+        const list = Array.isArray(result) ? result : []
+        const batches = list.filter((item: any) => String(item.command || '').startsWith('batch:'))
+        return Response.json(batches, { headers: CORS })
+      } catch {
+        return Response.json([], { headers: CORS })
+      }
+    }
+
+    // POST /api/sensor-batch/stream — SSE: run batch_mpu6050.py with live output
+    if (url.pathname === '/api/sensor-batch/stream' && req.method === 'POST') {
+      const body = await req.json()
+      const batchSize = parseInt(body.batch_size) || 10
+      const intervalMs = parseInt(body.interval_ms) || 500
+      const scriptPath = '/home/rythmn/batch_mpu6050.py'
+
+      const enc = new TextEncoder()
+      const { readable, writable } = new TransformStream()
+      const writer = writable.getWriter()
+      const send = async (data: object) => writer.write(enc.encode('data: ' + JSON.stringify(data) + '\n\n')).catch(() => {})
+
+      const jobId = `batch-${Date.now()}`
+      ;(async () => {
+        try {
+          await send({ type: 'start', job_id: jobId, batch_size: batchSize, sensor: 'mpu6050' })
+          const proc = spawn('python3', [scriptPath, String(batchSize), String(intervalMs)], {
+            cwd: sessionCwd, env: process.env
+          })
+          runningJobs.set(jobId, proc)
+
+          let buf = ''
+          const flush = async (chunk: string) => {
+            buf += chunk
+            const lines = buf.split('\n')
+            buf = lines.pop() ?? ''
+            for (const line of lines) {
+              if (!line.trim()) continue
+              // Detect batch completion line
+              if (line.includes('batch_hash =')) {
+                const m = line.match(/batch_hash = ([0-9a-f]+)/)
+                if (m) await send({ type: 'batch_hash', hash: m[1] })
+              } else if (line.includes('Attested!')) {
+                const m = line.match(/nonce=(.+)/)
+                await send({ type: 'attested', nonce: m ? m[1] : '' })
+              } else if (line.includes('Batch #')) {
+                const m = line.match(/Batch #(\d+)/)
+                if (m) await send({ type: 'batch_start', batch_num: parseInt(m[1]) })
+              } else if (line.match(/^\s+\[\s*\d+\//)) {
+                // Individual reading line: [1/10] ax=...
+                await send({ type: 'reading', line: line.trim() })
+              } else {
+                await send({ type: 'log', line: line.trim() })
+              }
+            }
+          }
+
+          proc.stdout?.on('data', async (chunk: Buffer) => { await flush(chunk.toString()) })
+          proc.stderr?.on('data', async (chunk: Buffer) => { await send({ type: 'err', line: chunk.toString().trim() }) })
+          proc.on('close', async () => {
+            runningJobs.delete(jobId)
+            await send({ type: 'stopped' })
+            await writer.close().catch(() => {})
+          })
+        } catch (e: any) {
+          await send({ type: 'err', line: e.message })
+          await writer.close().catch(() => {})
+        }
+      })()
+
+      return new Response(readable, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*' } })
+    }
+
     // POST /api/run-py/stream — verified Python execution with live streaming output
     if (url.pathname === '/api/run-py/stream' && req.method === 'POST') {
       const body = await req.json()
